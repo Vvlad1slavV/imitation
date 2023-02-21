@@ -355,6 +355,7 @@ def generate_trajectories(
     rng: np.random.Generator,
     *,
     deterministic_policy: bool = False,
+    dict_obs_name: str = None
 ) -> Sequence[types.TrajectoryWithRew]:
     """Generate trajectory dictionaries from a policy and an environment.
 
@@ -378,7 +379,7 @@ def generate_trajectories(
         may be collected to avoid biasing process towards short episodes; the user
         should truncate if required.
     """
-    get_actions = policy_to_callable(policy, venv, deterministic_policy)
+    get_actions = policy_to_callable(policy, venv, deterministic_policy)        
 
     # Collect rollout tuples.
     trajectories = []
@@ -441,6 +442,117 @@ def generate_trajectories(
         n_steps = len(trajectory.acts)
         # extra 1 for the end
         exp_obs = (n_steps + 1,) + venv.observation_space.shape
+        real_obs = trajectory.obs.shape
+        assert real_obs == exp_obs, f"expected shape {exp_obs}, got {real_obs}"
+        exp_act = (n_steps,) + venv.action_space.shape
+        real_act = trajectory.acts.shape
+        assert real_act == exp_act, f"expected shape {exp_act}, got {real_act}"
+        exp_rew = (n_steps,)
+        real_rew = trajectory.rews.shape
+        assert real_rew == exp_rew, f"expected shape {exp_rew}, got {real_rew}"
+
+    return trajectories
+
+def generate_dict_trajectories(
+    policy: AnyPolicy,
+    venv: VecEnv,
+    sample_until: GenTrajTerminationFn,
+    rng: np.random.Generator,
+    *,
+    deterministic_policy: bool = False,
+    dict_obs_name: str,
+) -> Sequence[types.TrajectoryWithRew]:
+    """Generate trajectory dictionaries from a policy and an environment.
+
+    Args:
+        policy: Can be any of the following:
+            1) A stable_baselines3 policy or algorithm trained on the gym environment.
+            2) A Callable that takes an ndarray of observations and returns an ndarray
+            of corresponding actions.
+            3) None, in which case actions will be sampled randomly.
+        venv: The vectorized environments to interact with.
+        sample_until: A function determining the termination condition.
+            It takes a sequence of trajectories, and returns a bool.
+            Most users will want to use one of `min_episodes` or `min_timesteps`.
+        deterministic_policy: If True, asks policy to deterministically return
+            action. Note the trajectories might still be non-deterministic if the
+            environment has non-determinism!
+        rng: used for shuffling trajectories.
+
+    Returns:
+        Sequence of trajectories, satisfying `sample_until`. Additional trajectories
+        may be collected to avoid biasing process towards short episodes; the user
+        should truncate if required.
+    """
+    get_actions = policy_to_callable(policy, venv, deterministic_policy)        
+
+    # Collect rollout tuples.
+    trajectories = []
+    # accumulator for incomplete trajectories
+    trajectories_accum = TrajectoryAccumulator()
+    full_obs = venv.reset()
+    obs = full_obs[dict_obs_name]
+    for env_idx, ob in enumerate(obs):
+        # Seed with first obs only. Inside loop, we'll only add second obs from
+        # each (s,a,r,s') tuple, under the same "obs" key again. That way we still
+        # get all observations, but they're not duplicated into "next obs" and
+        # "previous obs" (this matters for, e.g., Atari, where observations are
+        # really big).
+        trajectories_accum.add_step(dict(obs=ob), env_idx)
+
+    # Now, we sample until `sample_until(trajectories)` is true.
+    # If we just stopped then this would introduce a bias towards shorter episodes,
+    # since longer episodes are more likely to still be active, i.e. in the process
+    # of being sampled from. To avoid this, we continue sampling until all epsiodes
+    # are complete.
+    #
+    # To start with, all environments are active.
+    active = np.ones(venv.num_envs, dtype=bool)
+    assert isinstance(obs, np.ndarray), "Dict/tuple observations are not supported."
+    while np.any(active):
+        acts = get_actions(full_obs)
+        full_obs, rews, dones, infos = venv.step(acts)
+        obs = full_obs[dict_obs_name]
+        for i, info in enumerate(infos):
+            if dones[i]:
+                infos[i]['terminal_observation'] = info['terminal_observation'][dict_obs_name]
+
+        assert isinstance(obs, np.ndarray)
+
+        # If an environment is inactive, i.e. the episode completed for that
+        # environment after `sample_until(trajectories)` was true, then we do
+        # *not* want to add any subsequent trajectories from it. We avoid this
+        # by just making it never done.
+        dones &= active
+
+        new_trajs = trajectories_accum.add_steps_and_auto_finish(
+            acts,
+            obs,
+            rews,
+            dones,
+            infos,
+        )
+        trajectories.extend(new_trajs)
+
+        if sample_until(trajectories):
+            # Termination condition has been reached. Mark as inactive any
+            # environments where a trajectory was completed this timestep.
+            active &= ~dones
+
+    # Note that we just drop partial trajectories. This is not ideal for some
+    # algos; e.g. BC can probably benefit from partial trajectories, too.
+
+    # Each trajectory is sampled i.i.d.; however, shorter episodes are added to
+    # `trajectories` sooner. Shuffle to avoid bias in order. This is important
+    # when callees end up truncating the number of trajectories or transitions.
+    # It is also cheap, since we're just shuffling pointers.
+    rng.shuffle(trajectories)  # type: ignore[arg-type]
+
+    # Sanity checks.
+    for trajectory in trajectories:
+        n_steps = len(trajectory.acts)
+        # extra 1 for the end
+        exp_obs = (n_steps + 1,) + venv.observation_space[dict_obs_name].shape
         real_obs = trajectory.obs.shape
         assert real_obs == exp_obs, f"expected shape {exp_obs}, got {real_obs}"
         exp_act = (n_steps,) + venv.action_space.shape
@@ -606,6 +718,7 @@ def rollout(
     unwrap: bool = True,
     exclude_infos: bool = True,
     verbose: bool = True,
+    dict_obs_name: str = None,
     **kwargs: Any,
 ) -> Sequence[types.TrajectoryWithRew]:
     """Generate policy rollouts.
@@ -640,13 +753,23 @@ def rollout(
         may be collected to avoid biasing process towards short episodes; the user
         should truncate if required.
     """
-    trajs = generate_trajectories(
+    if dict_obs_name is not None:
+        trajs = generate_dict_trajectories(
         policy,
         venv,
         sample_until,
         rng=rng,
+        dict_obs_name=dict_obs_name,
         **kwargs,
     )
+    else:
+        trajs = generate_trajectories(
+            policy,
+            venv,
+            sample_until,
+            rng=rng,
+            **kwargs,
+        )
     if unwrap:
         trajs = [unwrap_traj(traj) for traj in trajs]
     if exclude_infos:
